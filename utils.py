@@ -140,3 +140,56 @@ def format_results_table(
         rows.append(row)
 
     return "\n".join(rows)
+
+
+def format_phase2_results_table(
+    seq_lengths: List[int],
+    full_latencies_ms: List[float],
+    hier_latencies_ms: List[float],
+    full_memory_mb: List[float],
+    hier_memory_mb: List[float],
+    cosine_sims: Optional[List[float]] = None,
+    quality_metrics: Optional[List[dict]] = None,
+    token_budget: int = 256,
+) -> str:
+    """ASCII table for Phase 2 benchmark sweep including quality metrics."""
+    header = (
+        f"{'Seq Len':>7s} | "
+        f"{'Full (ms)':>10s} | "
+        f"{'Hier (ms)':>11s} | "
+        f"{'Speedup':>8s} | "
+        f"{'Full Mem':>9s} | "
+        f"{'Hier Mem':>10s} | "
+        f"{'Mem Saved':>10s}"
+    )
+    if cosine_sims is not None:
+        header += f" | {'CosSim':>7s}"
+    if quality_metrics is not None:
+        header += f" | {'Rec@B':>7s} | {'Jac':>6s}"
+
+    sep = "-" * len(header)
+    rows: List[str] = [header, sep]
+
+    for i, sl in enumerate(seq_lengths):
+        speedup = full_latencies_ms[i] / max(hier_latencies_ms[i], 1e-6)
+        mem_saved = (1.0 - hier_memory_mb[i] / max(full_memory_mb[i], 1e-6)) * 100.0
+        row = (
+            f"{sl:>7d} | "
+            f"{full_latencies_ms[i]:>10.3f} | "
+            f"{hier_latencies_ms[i]:>11.3f} | "
+            f"{speedup:>7.2f}x | "
+            f"{full_memory_mb[i]:>9.2f} | "
+            f"{hier_memory_mb[i]:>10.2f} | "
+            f"{mem_saved:>9.1f}%"
+        )
+        if cosine_sims is not None:
+            row += f" | {cosine_sims[i]:>7.4f}"
+        if quality_metrics is not None and i < len(quality_metrics):
+            qm = quality_metrics[i]
+            row += (
+                f" | {qm['token_recall_mean']:>7.4f}"
+                f" | {qm['attention_jaccard_mean']:>6.4f}"
+            )
+        rows.append(row)
+
+    return "\n".join(rows)
