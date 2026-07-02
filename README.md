@@ -1,8 +1,8 @@
 # Quest Baseline — Hierarchical Token-Level Sparse Attention
 
 Reference implementation reproducing the **Quest** page-wise sparse attention
-algorithm and extending it with **Phase 2 quality-oriented hierarchical
-token-level refinement**.  iSING Lab, HKUST.
+algorithm and extending it with **quality-oriented hierarchical token-level
+refinement**. iSING Lab, HKUST.
 
 ---
 
@@ -18,16 +18,19 @@ creating two critical bottlenecks at decode time:
 
 This project implements and benchmarks two sparse attention approaches that
 address both bottlenecks by attending to only the most relevant tokens at
-each decode step.
+each decode step. A HuggingFace patcher allows these methods to replace
+standard attention in real pretrained models.
+
+---
 
 ### Phase 1 — Quest Page-Wise Baseline
 
 Divides the KV cache into fixed-size *pages*, precomputes per-page key
 metadata (element-wise min/max), and selects only the **Top-K** pages for
-attention.  Sparse attention runs on exactly $K \times \text{page\_size}$
+attention. Sparse attention runs on exactly $K \times \text{page\_size}$
 tokens regardless of the full KV-cache size.
 
-### Phase 2 — Hierarchical Token-Level Refinement (Topic A)
+### Phase 2 — Hierarchical Token-Level Refinement
 
 Upgrades Quest with a **three-stage hierarchical filtering pipeline** that
 selects individual tokens rather than coarse pages, operating under the
@@ -39,6 +42,13 @@ selects individual tokens rather than coarse pages, operating under the
 
 Phase 2 achieves **34–130% better cosine similarity** than Phase 1 at the
 same budget, with token recall@B reaching 87% at 512 tokens.
+
+### HuggingFace Integration
+
+Standalone kernel functions extract the Q/K/V routing so sparse attention
+can replace standard attention layers in any HuggingFace model. A model
+patcher handles weight transfer and layer replacement for 9 model families
+(GPT-2, Llama, Mistral, Qwen2, Gemma, Falcon, Phi, Phi-3, OPT).
 
 ---
 
@@ -68,20 +78,41 @@ from $M > K$ pages, with sink and recent tokens always protected.
 ├── config.py                    # Configuration dataclasses (model, Quest, Phase 2, metrics)
 ├── utils.py                     # GPU timer, memory tracking, cosine similarity, formatting
 ├── full_attention.py            # Standard multi-head attention — the baseline
-├── quest_attention.py           # Phase 1: Quest page-wise sparse attention
-├── hierarchical_attention.py    # Phase 2: Hierarchical token-level attention
-├── experiment.py                # Benchmark harness (both phases) + correctness verification
+│
+├── quest_attention.py           # Phase 1: Quest page-wise sparse attention module
+├── hierarchical_attention.py    # Phase 2: Hierarchical token-level attention module
+├── sparse_attention_kernels.py  # Standalone kernel functions (no nn.Module) for both phases
+│                                #   _build_pages, quest_sparse_attention,
+│                                #   hierarchical_sparse_attention
+│
+├── experiment.py                # Benchmark harness (Phase 1 + Phase 2) + correctness
 ├── run_benchmark.py             # Phase 1 CLI
 ├── run_benchmark_phase2.py      # Phase 2 CLI with side-by-side comparison
+│
 ├── test_quest.py                # Phase 1 unit tests (19 tests)
 ├── test_phase2.py               # Phase 2 unit tests (27 tests)
+│
+├── hf_model_patcher.py          # HuggingFace attention layer replacement — 9 model families
+├── test_hf_patcher.py           # HF patcher unit tests (18 tests)
+├── eval_perplexity.py            # Perplexity evaluation on WikiText-2
+├── plot_real_model_results.py   # Perplexity figure generation
+│
+├── plot_results.py              # Generate core Phase-1-vs-Phase-2 quality figure
+├── talk_script.md               # 5-minute presentation script
+│
 ├── reports/
 │   ├── phase1_summary.pdf       # Phase 1 technical report
-│   ├── phase2_summary.pdf       # Phase 2 technical report
+│   ├── phase1_summary.tex       # Phase 1 report source
 │   ├── quest_explained_simply.pdf        # Phase 1 simple explanation
-│   └── hierarchical_explained_simply.pdf # Phase 2 simple explanation
-├── plot_results.py              # Generate core result figure
-├── talk_script.md               # 5-minute presentation script
+│   ├── quest_explained_simply.tex
+│   ├── phase2_summary.pdf       # Phase 2 technical report
+│   ├── phase2_summary.tex       # Phase 2 report source
+│   ├── hierarchical_explained_simply.pdf # Phase 2 simple explanation
+│   ├── hierarchical_explained_simply.tex
+│   ├── phase2_quality_vs_budget.pdf      # Core result figure
+│   ├── longbench_evaluation_demo.pdf     # LongBench evaluation demo
+│   └── (more generated plots)
+│
 └── README.md
 ```
 
@@ -93,6 +124,11 @@ from $M > K$ pages, with sink and recent tokens always protected.
 
 ```bash
 pip install torch matplotlib
+```
+
+For real-model evaluation:
+```bash
+pip install transformers datasets
 ```
 
 ### Run Phase 1 benchmark (Quest baseline)
@@ -120,6 +156,7 @@ python run_benchmark_phase2.py --device cpu --compare-baseline
 ```bash
 python test_quest.py          # 19 tests — Phase 1 (Quest)
 python test_phase2.py         # 27 tests — Phase 2 (Hierarchical)
+python test_hf_patcher.py     # 18 tests — HuggingFace patcher
 ```
 
 ### Generate the core result figure
@@ -130,6 +167,13 @@ python plot_results.py
 
 # Use cached data from a previous run (faster)
 python plot_results.py --cached
+```
+
+### Evaluate on a real model (HuggingFace)
+
+```bash
+# Perplexity comparison on WikiText-2 (GPT-2 by default)
+python eval_perplexity.py --model gpt2 --max-samples 50
 ```
 
 ---
@@ -191,29 +235,26 @@ pip install torch          # CPU
 
 # Install plotting dependency
 pip install matplotlib
+
+# For HF model evaluation
+pip install transformers datasets
 ```
 
 ### Step 1 — Verify Phase 1 baseline
 
 ```bash
-# Run all Phase 1 tests
 python test_quest.py
-
 # Expected: 19 tests pass, OK
 
-# Quick benchmark
 python run_benchmark.py --device cpu --kv-lens 512 1024 2048 --num-benchmark 20
 ```
 
 ### Step 2 — Verify Phase 2 optimization
 
 ```bash
-# Run all Phase 2 tests
 python test_phase2.py
-
 # Expected: 27 tests pass, OK
 
-# Quick benchmark
 python run_benchmark_phase2.py --device cpu --kv-lens 512 1024 2048 \
     --num-benchmark 20 --num-warmup 3
 ```
@@ -229,20 +270,34 @@ python run_benchmark_phase2.py --device cpu --compare-baseline \
 python plot_results.py
 ```
 
-### Step 4 — Generate the figure
+### Step 4 — Verify HuggingFace integration
 
 ```bash
-# Auto-runs benchmarks first, then plots
-python plot_results.py
+python test_hf_patcher.py
+# Expected: 18 tests pass, OK
 
-# This produces: reports/phase2_quality_vs_budget.pdf
+# Real-model perplexity evaluation
+python eval_perplexity.py --model gpt2 --max-samples 10
 ```
 
 ---
 
 ## Implementation Details
 
-### Phase 2 Algorithm
+### Phase 1 — Quest Page-Wise Sparse Attention
+
+```
+Input:  Q (1 decode query), KV cache of T tokens
+Output: Attention output over Top-K pages (K × page_size tokens)
+
+1. Build pages: partition K/V into fixed-size page_size pages
+2. Page metadata: compute element-wise min/max per page
+3. Score pages: (Q · K_min) and (Q · K_max) → channel-max → sum → scalar/page
+4. Select Top-K pages by score
+5. Gather selected K/V pages → scaled dot-product attention
+```
+
+### Phase 2 — Hierarchical Token-Level Attention
 
 ```
 Input:  Q (1 decode query), KV cache of T tokens
@@ -269,6 +324,23 @@ SPARSE ATTENTION
  12. Merge heads → output projection
 ```
 
+### HuggingFace Integration
+
+```
+1. Detect model type from config (~model_type)
+2. Navigate to the transformer layers list via a model-specific path
+3. For each layer:
+   a. Read existing attention module's Q/K/V/O projection weights
+   b. Transfer weights: GPT-2 Conv1D → nn.Linear or standard → standard
+   c. Replace with _SparseAttentionWrapper(quest/hierarchical module)
+4. Return patched model ready for forward pass
+```
+
+The standalone kernels in `sparse_attention_kernels.py` operate on
+**already-projected** Q/K/V tensors with no `nn.Module` dependency, enabling
+clean interception: extract Q/K/V from any HF model → route through the
+sparse kernel → plug the output back.
+
 ### Key Design Decisions
 
 - **Budget invariant**: $B = \text{top\_k} \times \text{page\_size}$ is
@@ -282,6 +354,9 @@ SPARSE ATTENTION
 - **Module interface compatibility**: `HierarchicalTokenAttention`,
   `QuestAttention`, and `MultiHeadFullAttention` share the same
   `(hidden_states, mask, *, return_kv)` interface.
+- **Kernel separation**: Standalone kernels (`quest_sparse_attention`,
+  `hierarchical_sparse_attention`) operate on pre-projected Q/K/V, enabling
+  integration with any model that provides its own projections.
 
 ---
 
