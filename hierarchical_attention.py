@@ -59,8 +59,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Re-use the page-building helper from quest_attention
-from quest_attention import _build_pages, QuestAttention
+# Re-use the page-building helper from sparse_attention_kernels
+from sparse_attention_kernels import _build_pages
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -102,6 +102,7 @@ class HierarchicalTokenAttention(nn.Module):
         adaptive_budget: bool = True,
         token_budget: int | None = None,
         dropout_p: float = 0.0,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -125,10 +126,10 @@ class HierarchicalTokenAttention(nn.Module):
         # Linear projections
         q_dim = num_heads * head_dim
         kv_dim = num_kv_heads * head_dim
-        self.q_proj = nn.Linear(hidden_dim, q_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_dim, kv_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, kv_dim, bias=False)
-        self.o_proj = nn.Linear(q_dim, hidden_dim, bias=False)
+        self.q_proj = nn.Linear(hidden_dim, q_dim, bias=bias)
+        self.k_proj = nn.Linear(hidden_dim, kv_dim, bias=bias)
+        self.v_proj = nn.Linear(hidden_dim, kv_dim, bias=bias)
+        self.o_proj = nn.Linear(q_dim, hidden_dim, bias=bias)
 
     # ──────────────────────────────────────────────────────────────────────
     # Stage 1 — Macro page scoring (reuses Quest methodology)
@@ -445,9 +446,10 @@ class HierarchicalTokenAttention(nn.Module):
         if is_protected.sum() > B_target * B * H:
             # Too many protected tokens — tier the boosts so that
             #   recent > sink > competitive
-            # This guarantees the most important tokens survive truncation.
-            boosted_scores[is_recent & token_validity] = float("inf")
-            boosted_scores[is_sink & token_validity & ~is_recent] = float("inf") / 2
+            # Use large finite values (not inf) so tiering actually works:
+            # IEEE 754 inf / 2 == inf, which defeats the ordering.
+            boosted_scores[is_recent & token_validity] = 1e10
+            boosted_scores[is_sink & token_validity & ~is_recent] = 1e9
         else:
             boosted_scores[is_protected] = float("inf")
 
@@ -530,6 +532,61 @@ class HierarchicalTokenAttention(nn.Module):
     # ──────────────────────────────────────────────────────────────────────
     # Full forward pass
     # ──────────────────────────────────────────────────────────────────────
+    def forward_preprojected(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        *,
+        return_metrics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """Hierarchical sparse attention using externally-projected Q/K/V.
+
+        Bypasses the internal ``q_proj/k_proj/v_proj`` projection layers and
+        delegates directly to the standalone ``hierarchical_sparse_attention``
+        kernel.  This is the entry-point for HuggingFace model integration,
+        where Q/K/V are projected by the host model's own projections.
+
+        Args:
+            Q:    (B, num_heads, T, head_dim) — pre-projected query.
+            K:    (B, num_kv_heads, T_kv, head_dim) — pre-projected key.
+            V:    (B, num_kv_heads, T_kv, head_dim) — pre-projected value.
+            mask: Optional causal/additive mask for prefill.
+            return_metrics: If True, also return a dict of internal metrics.
+
+        Returns:
+            output: (B, T, hidden_dim), or (output, metrics_dict) if
+                    ``return_metrics=True``.
+        """
+        from sparse_attention_kernels import hierarchical_sparse_attention
+
+        B, _, T, _ = Q.shape
+
+        attn_out, kernel_metrics = hierarchical_sparse_attention(
+            Q=Q,
+            K=K,
+            V=V,
+            page_size=self.page_size,
+            top_k=self.top_k,
+            macro_multiplier=self.macro_multiplier,
+            num_sink_tokens=self.num_sink_tokens,
+            num_recent_tokens=self.num_recent_tokens,
+            adaptive_budget=self.adaptive_budget,
+            token_budget=self.token_budget,
+            mask=mask,
+            num_kv_groups=self.num_kv_groups,
+        )
+        # attn_out: (B, num_heads, T, head_dim)
+
+        # Merge heads → (B, T, hidden_dim)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
+        output = self.o_proj(attn_out)
+
+        if return_metrics:
+            return output, kernel_metrics
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -537,6 +594,7 @@ class HierarchicalTokenAttention(nn.Module):
         *,
         return_kv: bool = False,
         return_metrics: bool = False,
+        **kwargs,  # accept HF-specific kwargs and ignore
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -662,6 +720,10 @@ class HierarchicalTokenAttention(nn.Module):
             Q_prefill = Q[:, :, :-1, :]
             scale = 1.0 / math.sqrt(self.head_dim)
             attn_scores_pre = torch.matmul(Q_prefill, K_bc.transpose(-2, -1)) * scale
+
+            if mask is not None:
+                attn_scores_pre = attn_scores_pre + mask
+
             attn_weights_pre = F.softmax(attn_scores_pre, dim=-1)
             attn_out_pre = torch.matmul(attn_weights_pre, V_bc)
             attn_out_pre = (

@@ -25,49 +25,10 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Page-building helper
+# Page-building helper — canonical version lives in sparse_attention_kernels
 # ---------------------------------------------------------------------------
 
-def _build_pages(
-    K: torch.Tensor,
-    V: torch.Tensor,
-    page_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Partition K and V tensors into fixed-size pages.
-
-    Args:
-        K: Key tensor   of shape (B, num_kv_heads, T_kv, head_dim).
-        V: Value tensor of shape (B, num_kv_heads, T_kv, head_dim).
-        page_size: Tokens per page.
-
-    Returns:
-        K_paged:   (B, num_kv_heads, num_pages, page_size, head_dim)
-        V_paged:   (B, num_kv_heads, num_pages, page_size, head_dim)
-        pad_mask:  (1, 1, num_pages, page_size)  — True for valid tokens.
-        num_pages: int
-    """
-    B, H, T, d = K.shape
-
-    # Create validity mask BEFORE padding: shape (B, 1, T, 1)
-    valid_mask = torch.ones(B, 1, T, 1, device=K.device, dtype=K.dtype)
-
-    # Pad sequence length to be a multiple of page_size
-    if T % page_size != 0:
-        pad_len = page_size - (T % page_size)
-        K = F.pad(K, (0, 0, 0, pad_len))
-        V = F.pad(V, (0, 0, 0, pad_len))
-        valid_mask = F.pad(valid_mask, (0, 0, 0, pad_len))  # pads with zeros
-        T_padded = T + pad_len
-    else:
-        T_padded = T
-
-    num_pages = T_padded // page_size
-
-    K_paged = K.view(B, H, num_pages, page_size, d)
-    V_paged = V.view(B, H, num_pages, page_size, d)
-    pad_mask = valid_mask.view(B, 1, num_pages, page_size, 1).bool()
-
-    return K_paged, V_paged, pad_mask, num_pages
+from sparse_attention_kernels import _build_pages  # noqa: E402, F401 — re-export
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +60,7 @@ class QuestAttention(nn.Module):
         page_size: int = 64,
         top_k: int = 4,
         dropout_p: float = 0.0,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -113,10 +75,10 @@ class QuestAttention(nn.Module):
         # Linear projections
         q_dim = num_heads * head_dim
         kv_dim = num_kv_heads * head_dim
-        self.q_proj = nn.Linear(hidden_dim, q_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_dim, kv_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, kv_dim, bias=False)
-        self.o_proj = nn.Linear(q_dim, hidden_dim, bias=False)
+        self.q_proj = nn.Linear(hidden_dim, q_dim, bias=bias)
+        self.k_proj = nn.Linear(hidden_dim, kv_dim, bias=bias)
+        self.v_proj = nn.Linear(hidden_dim, kv_dim, bias=bias)
+        self.o_proj = nn.Linear(q_dim, hidden_dim, bias=bias)
 
     # ------------------------------------------------------------------
     # Step 1 — Page metadata (element-wise min & max of keys per page)
@@ -265,12 +227,55 @@ class QuestAttention(nn.Module):
     # ------------------------------------------------------------------
     # Full forward pass
     # ------------------------------------------------------------------
+    def forward_preprojected(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Quest sparse attention using externally-projected Q/K/V.
+
+        Bypasses the internal ``q_proj/k_proj/v_proj`` projection layers and
+        delegates directly to the standalone ``quest_sparse_attention`` kernel.
+        This is the entry-point for HuggingFace model integration, where Q/K/V
+        are projected by the host model's own projection layers.
+
+        Args:
+            Q:    (B, num_heads, T, head_dim) — pre-projected query.
+            K:    (B, num_kv_heads, T_kv, head_dim) — pre-projected key.
+            V:    (B, num_kv_heads, T_kv, head_dim) — pre-projected value.
+            mask: Optional causal/additive mask for prefill.
+
+        Returns:
+            output: (B, T, hidden_dim)
+        """
+        from sparse_attention_kernels import quest_sparse_attention
+
+        B, _, T, _ = Q.shape
+
+        attn_out, _ = quest_sparse_attention(
+            Q=Q,
+            K=K,
+            V=V,
+            page_size=self.page_size,
+            top_k=self.top_k,
+            mask=mask,
+            num_kv_groups=self.num_kv_groups,
+        )
+        # attn_out: (B, num_heads, T, head_dim)
+
+        # Merge heads → (B, T, hidden_dim)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.o_proj(attn_out)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         mask: Optional[torch.Tensor] = None,  # pylint: disable=unused-argument
         *,
         return_kv: bool = False,
+        **kwargs,  # accept HF-specific kwargs (layer_past, attention_mask, etc.) and ignore
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quest sparse attention forward pass.
 
@@ -338,6 +343,10 @@ class QuestAttention(nn.Module):
             Q_prefill = Q[:, :, :-1, :]  # (B, H, T-1, d)
             scale = 1.0 / math.sqrt(self.head_dim)
             attn_scores_pre = torch.matmul(Q_prefill, K_bc.transpose(-2, -1)) * scale
+
+            if mask is not None:
+                attn_scores_pre = attn_scores_pre + mask
+
             attn_weights_pre = F.softmax(attn_scores_pre, dim=-1)
             attn_out_pre = torch.matmul(attn_weights_pre, V_bc)
             attn_out_pre = (

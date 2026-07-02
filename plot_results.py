@@ -347,13 +347,19 @@ def main():
     token_budget = 256  # top_k=4 × page_size=64
 
     if args.no_sweep:
-        # Use the verified reference results from our final benchmark run
-        print("  Using reference benchmark data (no sweep mode)")
-        kv_lengths = [512, 1024, 2048, 4096, 8192]
-        p1_cosims = [0.7346, 0.5012, 0.3791, 0.2486, 0.1779]
-        p2_cosims = [0.9832, 0.9367, 0.7944, 0.5537, 0.4099]
-        p1_speedups = [0.32, 0.48, 0.71, 1.16, 1.98]
-        p2_speedups = [0.14, 0.15, 0.19, 0.33, 0.59]
+        # Load reference results from the cache file (avoids stale hardcoded data)
+        cache = load_cache()
+        if cache is None:
+            print("  No cached benchmark data found. "
+                  "Run without --no-sweep to generate it, "
+                  "or provide a cache file.", file=sys.stderr)
+            sys.exit(1)
+        print("  Using cached benchmark data (no-sweep mode)")
+        kv_lengths = cache["kv_lengths"]
+        p1_cosims = cache["p1_cosims"]
+        p2_cosims = cache["p2_cosims"]
+        p1_speedups = cache.get("p1_speedups")
+        p2_speedups = cache.get("p2_speedups")
     elif args.cached:
         data = load_cache()
         if data is None:

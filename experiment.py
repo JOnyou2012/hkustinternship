@@ -103,20 +103,12 @@ def benchmark_decode_step(
     K_min = K_paged.min(dim=3).values  # (1, H_kv, num_pages, d)
     K_max = K_paged.max(dim=3).values
 
-    # Quest scoring function — separate so we can time it independently
-    def _quest_score_and_select():
-        if num_kv_groups > 1:
-            K_min_bc = K_min.repeat_interleave(num_kv_groups, dim=1)
-            K_max_bc = K_max.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_min_bc = K_min
-            K_max_bc = K_max
+    # Quest scoring — delegates to the canonical static method so the
+    # experiment stays in sync with the module implementation.
+    from quest_attention import QuestAttention as _QA
 
-        Q_exp = Q.expand(-1, -1, num_pages, -1)
-        prod_min = Q_exp * K_min_bc
-        prod_max = Q_exp * K_max_bc
-        combined = torch.max(prod_min, prod_max)
-        scores = combined.sum(dim=-1)  # (1, num_heads, num_pages)
+    def _quest_score_and_select():
+        scores = _QA.score_pages(Q, K_min, K_max)  # handles GQA broadcast
         effective_k = min(top_k, num_pages)
         _, indices = torch.topk(scores, k=effective_k, dim=-1)
         return indices  # (1, num_heads, top_k)
@@ -344,8 +336,11 @@ def _verify_decode_step(
     Uses identical Q/K/V tensors so the comparison isolates the effect of
     page-wise sparse attention.
     """
+    from sparse_attention_kernels import quest_sparse_attention
+
     device_obj = torch.device(device)
     generator = torch.Generator(device=device_obj).manual_seed(42)
+    num_kv_groups = num_heads // num_kv_heads
 
     Q = torch.randn(1, num_heads, 1, head_dim,
                      device=device_obj, dtype=dtype, generator=generator)
@@ -354,7 +349,6 @@ def _verify_decode_step(
     V = torch.randn(1, num_kv_heads, kv_len, head_dim,
                      device=device_obj, dtype=dtype, generator=generator)
 
-    num_kv_groups = num_heads // num_kv_heads
     if num_kv_groups > 1:
         K_bc = K.repeat_interleave(num_kv_groups, dim=1)
         V_bc = V.repeat_interleave(num_kv_groups, dim=1)
@@ -369,72 +363,13 @@ def _verify_decode_step(
         weights_full = F.softmax(scores_full, dim=-1)
         out_full = torch.matmul(weights_full, V_bc)
 
-    # ---- Quest sparse attention output ----
-    # Page construction
-    if kv_len % page_size != 0:
-        pad_len = page_size - (kv_len % page_size)
-        K_padded = F.pad(K, (0, 0, 0, pad_len))
-        V_padded = F.pad(V, (0, 0, 0, pad_len))
-        valid_mask = torch.ones(1, 1, kv_len, 1, device=device_obj, dtype=torch.bool)
-        valid_mask = F.pad(valid_mask, (0, 0, 0, pad_len))
-    else:
-        K_padded = K
-        V_padded = V
-        valid_mask = torch.ones(1, 1, kv_len, 1, device=device_obj, dtype=torch.bool)
-
-    kv_padded = K_padded.size(2)
-    num_pages = kv_padded // page_size
-
-    K_paged = K_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
-    V_paged = V_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
-    pad_mask = valid_mask.view(1, 1, num_pages, page_size, 1)
-
-    K_min = K_paged.min(dim=3).values
-    K_max = K_paged.max(dim=3).values
-
-    if num_kv_groups > 1:
-        K_min_bc = K_min.repeat_interleave(num_kv_groups, dim=1)
-        K_max_bc = K_max.repeat_interleave(num_kv_groups, dim=1)
-    else:
-        K_min_bc = K_min
-        K_max_bc = K_max
-
+    # ---- Quest sparse attention output (using kernel) ----
     with torch.no_grad():
-        # Stage 1: Score pages
-        Q_exp = Q.expand(-1, -1, num_pages, -1)
-        prod_min = Q_exp * K_min_bc
-        prod_max = Q_exp * K_max_bc
-        combined = torch.max(prod_min, prod_max)
-        scores = combined.sum(dim=-1)
-        effective_k = min(top_k, num_pages)
-        _, page_indices = torch.topk(scores, k=effective_k, dim=-1)
-
-        # Stage 2: Sparse attention on selected pages
-        H_q = Q.size(1)
-        top_k_actual = page_indices.size(-1)
-        if num_kv_groups > 1:
-            K_pg = K_paged.repeat_interleave(num_kv_groups, dim=1)
-            V_pg = V_paged.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_pg = K_paged
-            V_pg = V_paged
-
-        # pad_mask: (1, 1, num_pages, page_size, 1) — broadcast to H_q
-        pm = pad_mask.expand(-1, H_q, -1, -1, -1)
-
-        idx = page_indices.view(1, H_q, top_k_actual, 1, 1).expand(
-            -1, -1, -1, page_size, head_dim
+        out_quest, _ = quest_sparse_attention(
+            Q=Q, K=K, V=V,
+            page_size=page_size, top_k=top_k,
+            num_kv_groups=num_kv_groups,
         )
-        K_sel = K_pg.gather(dim=2, index=idx).reshape(1, H_q, top_k_actual * page_size, head_dim)
-        V_sel = V_pg.gather(dim=2, index=idx).reshape(1, H_q, top_k_actual * page_size, head_dim)
-
-        idx_m = page_indices.view(1, H_q, top_k_actual, 1, 1).expand(-1, -1, -1, page_size, 1)
-        m_sel = pm.gather(dim=2, index=idx_m).reshape(1, H_q, 1, top_k_actual * page_size)
-
-        scores_q = torch.matmul(Q, K_sel.transpose(-2, -1)) * scale
-        scores_q = scores_q.masked_fill(~m_sel, float("-inf"))
-        weights_q = F.softmax(scores_q, dim=-1)
-        out_quest = torch.matmul(weights_q, V_sel)
 
     out_full_f = out_full.to(device_obj).float()
     out_quest_f = out_quest.to(device_obj).float()
@@ -511,45 +446,30 @@ def benchmark_decode_step_phase2(
     K_paged = K_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
     V_paged = V_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
 
+    # Build pad_mask — True for valid (non-padding) positions
+    pad_mask = torch.ones(1, 1, kv_len, 1, device=device_obj, dtype=torch.bool)
+    if kv_len % page_size != 0:
+        pad_mask = F.pad(pad_mask, (0, 0, 0, kv_padded - kv_len))
+    pad_mask = pad_mask.view(1, 1, num_pages, page_size, 1)
+
     K_min = K_paged.min(dim=3).values
     K_max = K_paged.max(dim=3).values
 
-    # ---- Macro page scoring function ----
+    # ---- Macro page scoring — delegates to module static methods ----
+    from hierarchical_attention import HierarchicalTokenAttention as _HTA
+
     def _page_scoring():
-        if num_kv_groups > 1:
-            K_min_bc = K_min.repeat_interleave(num_kv_groups, dim=1)
-            K_max_bc = K_max.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_min_bc = K_min
-            K_max_bc = K_max
+        scores = _HTA._score_pages_quest(Q, K_min, K_max)  # (1, H, num_pages)
 
-        Q_exp = Q.expand(-1, -1, num_pages, -1)
-        prod_min = Q_exp * K_min_bc
-        prod_max = Q_exp * K_max_bc
-        combined = torch.max(prod_min, prod_max)
-        scores = combined.sum(dim=-1)  # (1, H, num_pages)
-
-        # Adaptive M
         base_M = min(macro_multiplier * top_k, num_pages)
         if adaptive_budget and num_pages > 2:
-            avg_scores = scores.mean(dim=(0, 1))
-            sorted_s = avg_scores.sort(descending=True).values
-            top2_sum = sorted_s[:2].sum()
-            total_sum = sorted_s.sum() + 1e-8
-            concentration = (top2_sum / total_sum).item()
-            if concentration > 0.5:
-                M_eff = max(base_M // 2, 2)
-            elif concentration < 0.3:
-                M_eff = min(base_M * 2, num_pages)
-            else:
-                M_eff = base_M
+            M_eff = _HTA._compute_adaptive_M(scores, base_M, num_pages)
         else:
             M_eff = base_M
         M_eff = max(M_eff, top_k)
         M_eff = min(M_eff, num_pages)
 
-        # Use the module's reusable macro page selection with sink/recent protection
-        macro_pages = HierarchicalTokenAttention.select_macro_pages(
+        macro_pages = _HTA.select_macro_pages(
             page_scores=scores,
             M=M_eff,
             num_pages=num_pages,
@@ -560,41 +480,11 @@ def benchmark_decode_step_phase2(
         )
         return scores, macro_pages, M_eff
 
-    # ---- Token-level scoring ----
+    # ---- Token-level scoring — delegates to module static method ----
     def _token_scoring(macro_pages):
-        M = macro_pages.size(-1)
-        H_q = Q.size(1)
-
-        K_pg = K_paged
-        if num_kv_groups > 1:
-            K_pg = K_paged.repeat_interleave(num_kv_groups, dim=1)
-
-        # Gather selected pages → flatten tokens
-        idx_k = macro_pages.view(1, H_q, M, 1, 1).expand(-1, -1, -1, page_size, head_dim)
-        K_sel = K_pg.gather(dim=2, index=idx_k).reshape(1, H_q, M * page_size, head_dim)
-
-        # Valid positions
-        valid_mask = torch.ones(1, 1, kv_len, 1, device=device_obj, dtype=torch.bool)
-        if kv_len % page_size != 0:
-            valid_mask = F.pad(valid_mask, (0, 0, 0, kv_padded - kv_len))
-        valid_paged = valid_mask.view(1, 1, num_pages, page_size, 1)
-        if valid_paged.size(1) != H_q:
-            valid_paged = valid_paged.repeat_interleave(H_q, dim=1)
-
-        idx_m = macro_pages.view(1, H_q, M, 1, 1).expand(-1, -1, -1, page_size, 1)
-        validity = valid_paged.gather(dim=2, index=idx_m).reshape(1, H_q, M * page_size).bool()
-
-        # Per-token exact scores
-        scale = 1.0 / math.sqrt(head_dim)
-        tk_scores = torch.matmul(Q, K_sel.transpose(-2, -1)).squeeze(-2) * scale
-        tk_scores = tk_scores.masked_fill(~validity, float("-inf"))
-
-        # Global positions
-        base_pos = macro_pages * page_size
-        offsets = torch.arange(page_size, device=device_obj).view(1, 1, 1, page_size)
-        global_pos = (base_pos.unsqueeze(-1) + offsets).reshape(1, H_q, M * page_size)
-
-        return tk_scores, validity, global_pos
+        return _HTA._score_tokens_in_selected_pages(
+            Q, K_paged, pad_mask, macro_pages,
+        )
 
     # ---- Consolidation ----
     def _consolidate(tk_scores, validity, global_pos):
@@ -610,8 +500,8 @@ def benchmark_decode_step_phase2(
 
         boosted = tk_scores.clone()
         if is_protected.sum() > B_target * B * H:
-            boosted[is_recent & validity] = float("inf")
-            boosted[is_sink & validity & ~is_recent] = float("inf") / 2
+            boosted[is_recent & validity] = 1e10
+            boosted[is_sink & validity & ~is_recent] = 1e9
         else:
             boosted[is_protected] = float("inf")
 
@@ -977,6 +867,8 @@ def _verify_hierarchical_decode_step(
     dtype: torch.dtype = torch.float16,
 ) -> float:
     """Cosine similarity between full and hierarchical attention outputs."""
+    from sparse_attention_kernels import hierarchical_sparse_attention
+
     device_obj = torch.device(device)
     generator = torch.Generator(device=device_obj).manual_seed(42)
 
@@ -1006,132 +898,18 @@ def _verify_hierarchical_decode_step(
         weights_full = F.softmax(scores_full, dim=-1)
         out_full = torch.matmul(weights_full, V_bc)
 
-    # ---- Hierarchical attention (replicating the pipeline inline) ----
-    if kv_len % page_size != 0:
-        pad_len = page_size - (kv_len % page_size)
-        K_padded = F.pad(K, (0, 0, 0, pad_len))
-        V_padded = F.pad(V, (0, 0, 0, pad_len))
-    else:
-        K_padded = K
-        V_padded = V
-
-    kv_padded = K_padded.size(2)
-    num_pages = kv_padded // page_size
-
-    K_paged = K_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
-    V_paged = V_padded.view(1, num_kv_heads, num_pages, page_size, head_dim)
-
-    K_min = K_paged.min(dim=3).values
-    K_max = K_paged.max(dim=3).values
-
+    # ---- Hierarchical attention (using kernel) ----
     with torch.no_grad():
-        # Stage 1: Page scoring
-        if num_kv_groups > 1:
-            K_min_bc = K_min.repeat_interleave(num_kv_groups, dim=1)
-            K_max_bc = K_max.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_min_bc = K_min
-            K_max_bc = K_max
-
-        Q_exp = Q.expand(-1, -1, num_pages, -1)
-        prod_min = Q_exp * K_min_bc
-        prod_max = Q_exp * K_max_bc
-        combined = torch.max(prod_min, prod_max)
-        page_scores = combined.sum(dim=-1)
-
-        base_M = min(macro_multiplier * top_k, num_pages)
-        if adaptive_budget and num_pages > 2:
-            avg_scores = page_scores.mean(dim=(0, 1))
-            sorted_s = avg_scores.sort(descending=True).values
-            top2_s = sorted_s[:2].sum()
-            total_s = sorted_s.sum() + 1e-8
-            concentration = (top2_s / total_s).item()
-            if concentration > 0.5:
-                M_eff = max(base_M // 2, 2)
-            elif concentration < 0.3:
-                M_eff = min(base_M * 2, num_pages)
-            else:
-                M_eff = base_M
-        else:
-            M_eff = base_M
-        M_eff = max(M_eff, top_k)
-        M_eff = min(M_eff, num_pages)
-
-        from hierarchical_attention import HierarchicalTokenAttention
-        macro_pages = HierarchicalTokenAttention.select_macro_pages(
-            page_scores=page_scores,
-            M=M_eff,
-            num_pages=num_pages,
-            kv_len=kv_len,
-            page_size=page_size,
+        out_hier, _ = hierarchical_sparse_attention(
+            Q=Q, K=K, V=V,
+            page_size=page_size, top_k=top_k,
+            macro_multiplier=macro_multiplier,
             num_sink_tokens=num_sink_tokens,
             num_recent_tokens=num_recent_tokens,
+            adaptive_budget=adaptive_budget,
+            token_budget=token_budget,
+            num_kv_groups=num_kv_groups,
         )
-        M = macro_pages.size(-1)
-        H_q = Q.size(1)
-
-        # Stage 2: Token scoring
-        if num_kv_groups > 1:
-            K_pg = K_paged.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_pg = K_paged
-
-        idx_k = macro_pages.view(1, H_q, M, 1, 1).expand(-1, -1, -1, page_size, head_dim)
-        K_sel = K_pg.gather(dim=2, index=idx_k).reshape(1, H_q, M * page_size, head_dim)
-
-        valid_mask = torch.ones(1, 1, kv_len, 1, device=device_obj, dtype=torch.bool)
-        if kv_len % page_size != 0:
-            valid_mask = F.pad(valid_mask, (0, 0, 0, kv_padded - kv_len))
-        valid_paged = valid_mask.view(1, 1, num_pages, page_size, 1)
-        if valid_paged.size(1) != H_q:
-            valid_paged = valid_paged.repeat_interleave(H_q, dim=1)
-
-        idx_m = macro_pages.view(1, H_q, M, 1, 1).expand(-1, -1, -1, page_size, 1)
-        validity = valid_paged.gather(dim=2, index=idx_m).reshape(1, H_q, M * page_size).bool()
-
-        tk_scores = torch.matmul(Q, K_sel.transpose(-2, -1)).squeeze(-2) * scale
-        tk_scores = tk_scores.masked_fill(~validity, float("-inf"))
-
-        base_pos = macro_pages * page_size
-        offsets = torch.arange(page_size, device=device_obj).view(1, 1, 1, page_size)
-        global_pos = (base_pos.unsqueeze(-1) + offsets).reshape(1, H_q, M * page_size)
-
-        # Stage 3: Consolidation
-        eff_sink = min(num_sink_tokens, kv_len)
-        eff_recent = min(num_recent_tokens, kv_len)
-        is_sink = global_pos < eff_sink
-        is_recent = global_pos >= (kv_len - eff_recent)
-        is_protected = (is_sink | is_recent) & validity
-
-        boosted = tk_scores.clone()
-        if is_protected.sum() > token_budget:
-            boosted[is_recent & validity] = float("inf")
-            boosted[is_sink & validity & ~is_recent] = float("inf") / 2
-        else:
-            boosted[is_protected] = float("inf")
-
-        effective_B = min(token_budget, tk_scores.size(-1))
-        _, topk_idx = torch.topk(boosted, k=effective_B, dim=-1)
-
-        sel_pos = global_pos.gather(dim=-1, index=topk_idx)
-        sel_valid = validity.gather(dim=-1, index=topk_idx)
-
-        # Sparse attention
-        if num_kv_groups > 1:
-            K_pg2 = K_padded.repeat_interleave(num_kv_groups, dim=1)
-            V_pg2 = V_padded.repeat_interleave(num_kv_groups, dim=1)
-        else:
-            K_pg2 = K_padded
-            V_pg2 = V_padded
-
-        idx_g = sel_pos.unsqueeze(-1).expand(-1, -1, -1, head_dim).long()
-        K_tk = K_pg2.gather(dim=2, index=idx_g)
-        V_tk = V_pg2.gather(dim=2, index=idx_g)
-
-        attn_s = torch.matmul(Q, K_tk.transpose(-2, -1)) * scale
-        attn_s = attn_s.masked_fill(~sel_valid.unsqueeze(-2), float("-inf"))
-        attn_w = F.softmax(attn_s, dim=-1)
-        out_hier = torch.matmul(attn_w, V_tk)
 
     out_full_f = out_full.to(device_obj).float()
     out_hier_f = out_hier.to(device_obj).float()

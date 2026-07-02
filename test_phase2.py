@@ -14,13 +14,14 @@ Covers:
 from __future__ import annotations
 
 import math
+import os
 import sys
 import unittest
 
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/Users/jonathan/anaconda_projects/hkustinternship")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config, HierarchicalConfig, MetricsConfig
 from hierarchical_attention import HierarchicalTokenAttention

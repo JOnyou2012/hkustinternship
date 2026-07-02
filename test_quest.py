@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import math
+import os
 import sys
 import unittest
 
@@ -18,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 # Ensure the project root is on sys.path
-sys.path.insert(0, "/Users/jonathan/anaconda_projects/hkustinternship")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config, ModelConfig, QuestConfig
 from full_attention import MultiHeadFullAttention, scaled_dot_product_attention
