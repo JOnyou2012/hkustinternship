@@ -125,7 +125,11 @@ def format_results_table(
 
     for i, sl in enumerate(seq_lengths):
         speedup = full_latencies_ms[i] / max(quest_latencies_ms[i], 1e-6)
-        mem_saved = (1.0 - quest_memory_mb[i] / max(full_memory_mb[i], 1e-6)) * 100.0
+        if full_memory_mb[i] > 0.0:
+            mem_saved = (1.0 - quest_memory_mb[i] / full_memory_mb[i]) * 100.0
+            mem_str = f"{mem_saved:>9.1f}%"
+        else:
+            mem_str = f"{'N/A':>10s}"
         row = (
             f"{sl:>7d} | "
             f"{full_latencies_ms[i]:>10.3f} | "
@@ -133,7 +137,7 @@ def format_results_table(
             f"{speedup:>7.2f}x | "
             f"{full_memory_mb[i]:>9.2f} | "
             f"{quest_memory_mb[i]:>10.2f} | "
-            f"{mem_saved:>9.1f}%"
+            f"{mem_str}"
         )
         if cosine_sims is not None:
             row += f" | {cosine_sims[i]:>7.4f}"
@@ -172,7 +176,11 @@ def format_phase2_results_table(
 
     for i, sl in enumerate(seq_lengths):
         speedup = full_latencies_ms[i] / max(hier_latencies_ms[i], 1e-6)
-        mem_saved = (1.0 - hier_memory_mb[i] / max(full_memory_mb[i], 1e-6)) * 100.0
+        if full_memory_mb[i] > 0.0:
+            mem_saved = (1.0 - hier_memory_mb[i] / full_memory_mb[i]) * 100.0
+            mem_str = f"{mem_saved:>9.1f}%"
+        else:
+            mem_str = f"{'N/A':>10s}"
         row = (
             f"{sl:>7d} | "
             f"{full_latencies_ms[i]:>10.3f} | "
@@ -180,7 +188,7 @@ def format_phase2_results_table(
             f"{speedup:>7.2f}x | "
             f"{full_memory_mb[i]:>9.2f} | "
             f"{hier_memory_mb[i]:>10.2f} | "
-            f"{mem_saved:>9.1f}%"
+            f"{mem_str}"
         )
         if cosine_sims is not None:
             row += f" | {cosine_sims[i]:>7.4f}"

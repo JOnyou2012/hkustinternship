@@ -280,12 +280,16 @@ def run_sweep(
         quest_memories.append(qa_mem)
 
         speedup = fa_lat / max(qa_lat, 1e-6)
-        mem_saved = (1.0 - qa_mem / max(fa_mem, 1e-6)) * 100.0
+        mem_str = (
+            f"Mem saved: {(1.0 - qa_mem / fa_mem) * 100.0:.1f}%"
+            if fa_mem > 0.0
+            else "Mem: N/A (CPU)"
+        )
         print(
             f"Full: {fa_lat:7.3f} ms | "
             f"Quest: {qa_lat:7.3f} ms | "
             f"Speedup: {speedup:.2f}x | "
-            f"Mem saved: {mem_saved:.1f}%",
+            f"{mem_str}",
             end="",
         )
 
@@ -795,12 +799,16 @@ def run_sweep_phase2(
         hier_memories.append(qa_mem)
 
         speedup = fa_lat / max(qa_lat, 1e-6)
-        mem_saved = (1.0 - qa_mem / max(fa_mem, 1e-6)) * 100.0
+        mem_str = (
+            f"Mem saved: {(1.0 - qa_mem / fa_mem) * 100.0:.1f}%"
+            if fa_mem > 0.0
+            else "Mem: N/A (CPU)"
+        )
         print(
             f"Full: {fa_lat:7.3f} ms | "
             f"Hier: {qa_lat:7.3f} ms | "
             f"Speedup: {speedup:.2f}x | "
-            f"Mem saved: {mem_saved:.1f}%",
+            f"{mem_str}",
             end="",
         )
 

@@ -81,18 +81,18 @@ def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
 
     # Sanity checks
-    assert args.num_heads % args.num_kv_heads == 0, (
-        f"num_heads ({args.num_heads}) must be divisible by "
-        f"num_kv_heads ({args.num_kv_heads})"
-    )
+    if args.num_heads % args.num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({args.num_heads}) must be divisible by "
+            f"num_kv_heads ({args.num_kv_heads})"
+        )
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("⚠  CUDA not available — falling back to CPU.", file=sys.stderr)
         args.device = "cpu"
 
     print("=" * 70)
-    print("  Quest Baseline — Phase 1: Page-wise Sparse Attention")
-    print("  iSING Lab, HKUST")
+    print("  page wise sparse attention benchmark")
     print("=" * 70)
 
     # Run sweep
