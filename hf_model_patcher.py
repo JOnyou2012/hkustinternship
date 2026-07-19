@@ -205,7 +205,7 @@ class _SparseAttentionWrapper(nn.Module):
     def forward(self, *args, **kwargs):
         output = self.sparse_module(*args, **kwargs)
 
-        # Unwrap if our module returned (output, K, V) from return_kv
+        # Unwrap if our module returned a tuple
         if isinstance(output, tuple):
             main_output = output[0]
             if len(output) >= 2 and isinstance(output[1], dict):
@@ -224,11 +224,14 @@ class _SparseAttentionWrapper(nn.Module):
                         metrics.get("token_budget", -1),
                         metrics.get("page_scores_mean", float("nan")),
                     )
-                return main_output, None
-            # (output, K, V) or other tuples
-            return main_output, None
-        # Single tensor — wrap as (output, None) = (output, attn_weights=None)
-        return output, None
+                return main_output, None, None
+            # (output, K, V) or other tuples — return with placeholder None's
+            return main_output, None, None
+
+        # Single tensor — wrap as (output, attn_weights=None, past_key_value=None)
+        # Returns a 3-tuple to match both GPT-2 (indexed access) and
+        # Llama/Qwen/Mistral (3-value unpacking) conventions.
+        return output, None, None
 
 
 def _build_config_from_hf(model) -> dict:

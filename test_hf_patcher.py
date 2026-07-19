@@ -202,8 +202,10 @@ class TestSparseAttentionWrapper(unittest.TestCase):
         x = torch.randn(2, 4)
         out = wrapper(x)
         self.assertIsInstance(out, tuple)
-        self.assertEqual(len(out), 2)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(torch.equal(out[0], x))
         self.assertIsNone(out[1])
+        self.assertIsNone(out[2])
 
     def test_tuple_output_with_metrics(self):
         """Wrapper should extract main output and drop metrics dict."""
@@ -216,9 +218,10 @@ class TestSparseAttentionWrapper(unittest.TestCase):
         x = torch.randn(2, 4)
         out = wrapper(x)
         self.assertIsInstance(out, tuple)
-        self.assertEqual(len(out), 2)
+        self.assertEqual(len(out), 3)
         self.assertTrue(torch.equal(out[0], x))
         self.assertIsNone(out[1])
+        self.assertIsNone(out[2])
 
     def test_tuple_output_with_kv(self):
         """Wrapper should handle (output, K, V) tuples."""
@@ -231,9 +234,10 @@ class TestSparseAttentionWrapper(unittest.TestCase):
         x = torch.randn(2, 4)
         out = wrapper(x)
         self.assertIsInstance(out, tuple)
-        self.assertEqual(len(out), 2)
+        self.assertEqual(len(out), 3)
         self.assertTrue(torch.equal(out[0], x))
         self.assertIsNone(out[1])
+        self.assertIsNone(out[2])
 
 
 # ===================================================================

@@ -1,16 +1,3 @@
-"""
-Integration tests that load real pretrained models from HuggingFace.
-
-Unlike the structural tests in test_quest.py / test_phase2.py, these tests
-actually download a model, patch its attention layers, and verify that the
-real model produces sensible outputs on real tokenized text.
-
-These tests require `transformers` (and optionally `datasets` for perplexity).
-They are automatically skipped when not available.
-
-The test model is ``distilgpt2`` — small enough to load in seconds (~82 MB,
-6 layers, 12 heads, 768 hidden) but with realistic architectural dimensions.
-"""
 
 from __future__ import annotations
 
@@ -24,9 +11,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Guard: transformers must be installed
-# ═══════════════════════════════════════════════════════════════════════════════
+# check if transformers are installed
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
